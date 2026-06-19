@@ -23,19 +23,45 @@ fi
 echo "Using $(python3 --version) at $(command -v python3)"
 
 # --- create the virtual environment ----------------------------------------
+# Fresh Debian/Ubuntu/Raspberry Pi OS often lacks ensurepip (it ships in the
+# separate python3-venv package), so a normal "python3 -m venv" fails with
+# "ensurepip is not available" and a half-made venv has no pip ("No module named
+# pip"). We create the venv WITHOUT pip (always works) and bootstrap pip below.
 if [ ! -d .venv ]; then
   echo "Creating virtual environment in ./.venv ..."
-  if ! python3 -m venv .venv; then
-    echo "ERROR: could not create the venv." >&2
-    echo "On Debian/Ubuntu install the venv package: sudo apt install python3-venv" >&2
+  if ! python3 -m venv .venv 2>/dev/null && ! python3 -m venv --without-pip --clear .venv; then
+    echo "ERROR: python3 cannot create a venv (the venv module is missing)." >&2
+    echo "  sudo apt install python3-venv     # Debian/Ubuntu/Raspberry Pi OS" >&2
+    exit 1
+  fi
+fi
+
+VENV_PY="$PWD/.venv/bin/python"
+
+# --- make sure pip exists inside the venv ----------------------------------
+if ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
+  echo "pip is not in the venv yet; bootstrapping it ..."
+  if "$VENV_PY" -m ensurepip --upgrade >/dev/null 2>&1; then
+    :                                            # ensurepip worked (offline)
+  elif command -v curl >/dev/null 2>&1; then
+    echo "  fetching get-pip.py ..."
+    curl -fsSL https://bootstrap.pypa.io/get-pip.py | "$VENV_PY" -
+  elif command -v wget >/dev/null 2>&1; then
+    echo "  fetching get-pip.py ..."
+    wget -qO- https://bootstrap.pypa.io/get-pip.py | "$VENV_PY" -
+  else
+    echo "ERROR: could not bootstrap pip (no ensurepip, and no curl/wget to fetch it)." >&2
+    echo "Install the system packages, then re-run:" >&2
+    echo "  sudo apt install python3-venv python3-pip   # Debian/Ubuntu/Raspberry Pi OS" >&2
+    echo "  rm -rf .venv && bash install.sh" >&2
     exit 1
   fi
 fi
 
 # --- install dependencies into the venv ------------------------------------
 echo "Installing dependencies ..."
-./.venv/bin/python -m pip install --upgrade pip >/dev/null
-./.venv/bin/python -m pip install -r requirements.txt
+"$VENV_PY" -m pip install --upgrade pip >/dev/null
+"$VENV_PY" -m pip install -r requirements.txt
 
 # --- make the scripts executable -------------------------------------------
 chmod +x inverter_reaction_tester.py run.sh 2>/dev/null || true
@@ -45,8 +71,8 @@ cat <<'EOF'
 Done.
 
 Run with the wrapper (uses ./.venv automatically):
-  ./run.sh --monitor --meter-iface <your-LAN-IP>          # check meter reception
-  ./run.sh --config my_setup.json                         # run a reaction test
+  ./run.sh --monitor                       # check the meter is being received
+  ./run.sh --config default_config.json    # run the reaction test
 
 Or activate the venv yourself:
   source .venv/bin/activate
