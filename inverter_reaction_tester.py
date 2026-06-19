@@ -42,7 +42,10 @@ attempt a reaction test.
 ------------------------------------------------------------------------------
 Requirements
 ------------------------------------------------------------------------------
-  Python 3.8+ and pymodbus 3.x     ->   pip install pymodbus
+  Python 3.7+. pymodbus 3.x on Python 3.8+, or pymodbus 2.5.3 on Python 3.7.
+  install.sh / requirements.txt select the right one automatically; manually:
+      pip install "pymodbus>=3.0,<4"     # Python 3.8+
+      pip install "pymodbus==2.5.3"      # Python 3.7
 
 Everything else is from the Python standard library.
 
@@ -97,15 +100,21 @@ import threading
 import time
 
 # --------------------------------------------------------------------------- #
-# Modbus client import (pymodbus 3.x preferred, 2.x fallback)
+# Modbus client import. pymodbus 3.x (Python 3.8+) uses the slave= kwarg; the 2.x
+# line (which still supports Python 3.7, e.g. Debian buster / older Pi OS) uses
+# unit=. We detect which is installed and remember the kwarg name -- 2.x silently
+# ignores an unknown kwarg, so we must NOT rely on a TypeError to tell them apart.
 # --------------------------------------------------------------------------- #
 try:
     from pymodbus.client import ModbusTcpClient            # pymodbus >= 3.0
+    _UNIT_KW = "slave"
 except ImportError:
     try:
         from pymodbus.client.sync import ModbusTcpClient   # pymodbus 2.x
+        _UNIT_KW = "unit"
     except ImportError:
         ModbusTcpClient = None
+        _UNIT_KW = "slave"
 
 
 # --------------------------------------------------------------------------- #
@@ -310,24 +319,15 @@ def decode_registers(regs, data_type, word_order):
 # pymodbus version-compatible helpers (slave= for 3.x, unit= for 2.x)
 # --------------------------------------------------------------------------- #
 def mb_read_holding(client, address, count, unit):
-    try:
-        return client.read_holding_registers(address, count=count, slave=unit)
-    except TypeError:
-        return client.read_holding_registers(address, count=count, unit=unit)
+    return client.read_holding_registers(address, count=count, **{_UNIT_KW: unit})
 
 
 def mb_write_single(client, address, value, unit):
-    try:
-        return client.write_register(address, value, slave=unit)
-    except TypeError:
-        return client.write_register(address, value, unit=unit)
+    return client.write_register(address, value, **{_UNIT_KW: unit})
 
 
 def mb_write_multi(client, address, values, unit):
-    try:
-        return client.write_registers(address, values, slave=unit)
-    except TypeError:
-        return client.write_registers(address, values, unit=unit)
+    return client.write_registers(address, values, **{_UNIT_KW: unit})
 
 
 def setpoint_scale(cfg):

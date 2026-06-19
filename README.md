@@ -80,7 +80,9 @@ set first — this tool only writes register 1111. Also check the read-back line
 
 ## Install
 
-Needs Python 3.8+ and `pymodbus` 3.x.
+Needs Python **3.7+**. On Python 3.8+ it uses `pymodbus` 3.x; on Python 3.7 (e.g.
+Debian buster / older Raspberry Pi OS) it uses `pymodbus` 2.5.3. `install.sh` and
+`requirements.txt` pick the right one automatically.
 
 **Linux / macOS** (creates a self-contained `./.venv`, recommended):
 

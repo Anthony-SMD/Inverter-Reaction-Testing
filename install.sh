@@ -38,17 +38,25 @@ fi
 
 VENV_PY="$PWD/.venv/bin/python"
 
+# get-pip.py has version-specific URLs for old Pythons; the generic one refuses to
+# run on < 3.8 ("minimum supported Python version is 3.10"). Pick the right URL.
+PYVER="$("$VENV_PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+case "$PYVER" in
+  2.*|3.[0-7]) GETPIP_URL="https://bootstrap.pypa.io/pip/$PYVER/get-pip.py" ;;
+  *)           GETPIP_URL="https://bootstrap.pypa.io/get-pip.py" ;;
+esac
+
 # --- make sure pip exists inside the venv ----------------------------------
 if ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
-  echo "pip is not in the venv yet; bootstrapping it ..."
+  echo "pip is not in the venv yet; bootstrapping it (Python $PYVER) ..."
   if "$VENV_PY" -m ensurepip --upgrade >/dev/null 2>&1; then
     :                                            # ensurepip worked (offline)
   elif command -v curl >/dev/null 2>&1; then
-    echo "  fetching get-pip.py ..."
-    curl -fsSL https://bootstrap.pypa.io/get-pip.py | "$VENV_PY" -
+    echo "  fetching $GETPIP_URL ..."
+    curl -fsSL "$GETPIP_URL" | "$VENV_PY" -
   elif command -v wget >/dev/null 2>&1; then
-    echo "  fetching get-pip.py ..."
-    wget -qO- https://bootstrap.pypa.io/get-pip.py | "$VENV_PY" -
+    echo "  fetching $GETPIP_URL ..."
+    wget -qO- "$GETPIP_URL" | "$VENV_PY" -
   else
     echo "ERROR: could not bootstrap pip (no ensurepip, and no curl/wget to fetch it)." >&2
     echo "Install the system packages, then re-run:" >&2
@@ -60,7 +68,7 @@ fi
 
 # --- install dependencies into the venv ------------------------------------
 echo "Installing dependencies ..."
-"$VENV_PY" -m pip install --upgrade pip >/dev/null
+"$VENV_PY" -m pip install --upgrade pip >/dev/null 2>&1 || true   # best-effort
 "$VENV_PY" -m pip install -r requirements.txt
 
 # --- make the scripts executable -------------------------------------------
