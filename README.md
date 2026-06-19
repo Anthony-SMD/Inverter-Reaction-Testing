@@ -24,11 +24,31 @@ measurement window.
 
 ## Install
 
+Needs Python 3.8+ and `pymodbus` 3.x.
+
+**Linux / macOS** (creates a self-contained `./.venv`, recommended):
+
 ```
-pip install -r requirements.txt
+bash install.sh
 ```
 
-Python 3.8+ and `pymodbus` 3.x.
+(`install.sh` makes `run.sh` executable, so `./run.sh` works afterwards.)
+
+Then run via the wrapper, which uses the venv automatically:
+
+```
+./run.sh --monitor --meter-iface 192.168.1.50
+```
+
+**Windows** (or any OS, manual):
+
+```
+pip install -r requirements.txt
+python inverter_reaction_tester.py --help
+```
+
+See the [Linux notes](#linux-notes) below for finding your interface IP and opening
+the firewall for the meter's multicast.
 
 ## The meter is multicast UDP, not TCP
 
@@ -102,12 +122,59 @@ resolution than the meter provides, the meter is the limiting factor — not thi
 - **Noise warning.** If the 50% threshold is within ~3× the measured meter noise, the
   tool warns you — use a bigger setpoint or a quieter load.
 
+## Linux notes
+
+The Python code is identical on every OS — only the environment setup differs.
+
+**Find your LAN interface IP** (use it for `--meter-iface`):
+
+```
+ip -4 addr            # look for the adapter on the meter's subnet, e.g. 192.168.1.50
+```
+
+**Open the firewall for the meter's multicast** (inbound UDP 9522). The meter only
+*broadcasts*, so you just need to let that traffic in:
+
+```
+# ufw (Ubuntu/Debian)
+sudo ufw allow 9522/udp
+
+# firewalld (Fedora/RHEL)
+sudo firewall-cmd --add-port=9522/udp        # add --permanent to persist
+
+# nftables/iptables (generic)
+sudo iptables -I INPUT -p udp --dport 9522 -j ACCEPT
+```
+
+No root or elevated privileges are needed to run the tool itself — port 9522 is
+unprivileged and Modbus uses an outbound TCP connection.
+
+**Confirm packets actually arrive** (optional sanity check, needs sudo for tcpdump):
+
+```
+sudo tcpdump -ni any host 239.12.255.254 and udp port 9522
+```
+
+If you see packets there but `--monitor` shows nothing, the multicast is arriving on a
+different interface than the kernel's default — pass that adapter's IP via
+`--meter-iface`.
+
+**Run it:**
+
+```
+./run.sh --monitor --meter-iface 192.168.1.50          # verify meter first
+./run.sh --inv-host 192.168.1.20 --inv-unit 3 --inv-register 40149 \
+         --datatype S32 --scale 1.0 --target-w -3000 \
+         --meter-iface 192.168.1.50 --trials 5
+```
+
 ## Troubleshooting
 
 No meter datagrams received:
 - Confirm the PC is on the same L2 network/VLAN as the meter.
-- Allow inbound UDP 9522 for `python.exe` in the Windows firewall.
-- On a multi-NIC PC, set `--meter-iface` to the LAN adapter's IP.
+- Open inbound UDP 9522 (Windows: allow `python.exe` in Windows Defender Firewall;
+  Linux: see the [firewall commands above](#linux-notes)).
+- On a multi-NIC machine, set `--meter-iface` to the LAN adapter's IP.
 - Verify the meter is powered and broadcasting on `239.12.255.254:9522`.
 
 Inverter write succeeds but meter never moves:

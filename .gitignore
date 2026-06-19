@@ -1,0 +1,10 @@
+# Python virtual environment created by install.sh
+.venv/
+
+# Byte-compiled files
+__pycache__/
+*.py[cod]
+
+# Local config copies (keep example_config.json, ignore personal ones)
+my_setup.json
+*.local.json

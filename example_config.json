@@ -10,7 +10,7 @@
   "scale": 1.0,
   "modbus_timeout": 3.0,
 
-  "target_w": -3000,
+  "target_w": -10000,
   "fraction": 0.5,
   "timeout": 10.0,
   "confirm": 1,

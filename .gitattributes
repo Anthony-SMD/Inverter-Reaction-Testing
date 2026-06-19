@@ -1,0 +1,4 @@
+# Keep shell scripts and Python LF-only so they run on Linux even if the repo is
+# cloned/edited on Windows (prevents CRLF "bad interpreter: ^M" errors).
+*.sh    text eol=lf
+*.py    text eol=lf
