@@ -1,0 +1,37 @@
+{
+  "_comment": "Percent-of-rated-power example. The inverter takes the setpoint as a % of rated power; the tool infers the rated power from the meter reaction. Copy and edit. CLI options override these. Keys use underscores.",
+
+  "inv_host": "192.168.1.20",
+  "inv_port": 502,
+  "inv_unit": 3,
+  "inv_register": 40023,
+  "datatype": "U16",
+  "word_order": "big",
+  "pct_scale": 0.01,
+  "modbus_timeout": 3.0,
+
+  "mode": "percent",
+  "target_percent": -50,
+  "rated_w": null,
+  "detect_watts": 0,
+  "fraction": 0.5,
+  "timeout": 10.0,
+  "confirm": 1,
+
+  "infer_timeout": 8.0,
+  "settle_samples": 3,
+  "settle_band_frac": 0.05,
+
+  "meter_group": "239.12.255.254",
+  "meter_port": 9522,
+  "meter_iface": "192.168.1.50",
+  "meter_serial": null,
+  "meter_src_ip": null,
+  "meter_timeout": 5.0,
+
+  "warmup": 2.0,
+  "trials": 5,
+  "settle": 3.0,
+  "no_reset": false,
+  "reset_value": 0.0
+}

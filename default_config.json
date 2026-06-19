@@ -1,0 +1,37 @@
+{
+  "_comment": "Default field config: percent-of-rated-power inverter at 192.168.101.28. Register 1111 holds the setpoint as %, pct_scale 0.1 means 100% = raw 1000 (so 10% = raw 100). Rated power is inferred from the meter reaction. Meter is received on the default network interface. Override any value on the CLI, e.g. ./run.sh --config default_config.json --target-percent -10",
+
+  "inv_host": "192.168.101.28",
+  "inv_port": 503,
+  "inv_unit": 1,
+  "inv_register": 1111,
+  "datatype": "S16",
+  "word_order": "big",
+  "pct_scale": 0.1,
+  "modbus_timeout": 3.0,
+
+  "mode": "percent",
+  "target_percent": 10,
+  "rated_w": null,
+  "detect_watts": 0,
+  "fraction": 0.5,
+  "timeout": 10.0,
+  "confirm": 1,
+
+  "infer_timeout": 8.0,
+  "settle_samples": 3,
+  "settle_band_frac": 0.05,
+
+  "meter_group": "239.12.255.254",
+  "meter_port": 9522,
+  "meter_iface": null,
+  "meter_serial": null,
+  "meter_src_ip": null,
+  "meter_timeout": 5.0,
+
+  "warmup": 2.0,
+  "trials": 5,
+  "settle": 3.0,
+  "no_reset": false,
+  "reset_value": 0.0
+}

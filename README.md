@@ -83,22 +83,64 @@ python inverter_reaction_tester.py --config my_setup.json
 
 CLI options always override the config file.
 
+## Percent-of-rated-power inverters
+
+Some inverters take the setpoint as a **% of rated power** instead of watts (e.g.
+SunSpec `WMaxLimPct`, many SMA models). You can't know the watts up front, so this tool
+commands the percent, waits for the reaction, then **infers the rated power** from how
+far the meter moved:
+
+```
+rated_power = |settled change at the meter| ÷ (percent ÷ 100)
+```
+
+```
+python inverter_reaction_tester.py \
+    --inv-host 192.168.1.20 --inv-unit 3 --inv-register 40023 \
+    --mode percent --datatype U16 --pct-scale 0.01 \
+    --target-percent -50 --meter-iface 192.168.1.50 --trials 5
+```
+
+What happens per session:
+
+1. **First reaction** — rated power is unknown, so the reaction is detected when the
+   meter moves past an absolute floor above its noise (`--detect-watts`, `0` = auto:
+   `max(50, 4× noise)`). Reaction time is measured at that crossing.
+2. **Settle & infer** — after reacting, the tool waits for the meter to settle
+   (`--infer-timeout`, `--settle-samples`, `--settle-band-frac`) and back-calculates the
+   rated power. It's printed per trial and aggregated in the summary.
+3. **Later trials** — now that rated power is known (running mean), detection switches
+   to `--fraction` of the *expected* change, exactly like watt mode. Pass a known
+   `--rated-w` to get that robustness from the very first trial.
+
+`--pct-scale` is the percent equivalent of `--scale`: **percent per register count**
+(`percent = raw × pct-scale`). So a register in whole `%` → `--pct-scale 1.0`; a
+register in `0.01 %` (write `5000` for 50 %) → `--pct-scale 0.01`. See
+`example_config_percent.json`.
+
 ## Key parameters (the reusable bits)
 
 | Option | Meaning |
 | --- | --- |
 | `--inv-host` / `--inv-port` / `--inv-unit` | Inverter Modbus TCP target (SMA inverters often use unit id **3**) |
 | `--inv-register` | Holding-register address of the power setpoint |
+| `--mode` | `watt` (default, uses `--target-w`) or `percent` (uses `--target-percent`, infers rated power) |
 | `--datatype` | `U16` / `S16` / `U32` / `S32` — match your inverter's register |
 | `--word-order` | `big` (high word first, most common) or `little`, for 32-bit values |
-| `--scale` | **Watts per register count.** `watts = raw × scale`. So `1.0` = register in W, `0.1` = register in 0.1 W, `10.0` = register in 10 W |
-| `--target-w` | Setpoint in watts (sign per your inverter; e.g. negative = discharge) |
-| `--fraction` | Meter must move by this fraction of \|target\| to count as reacted (`0.5` = 50%) |
+| `--scale` | **[watt mode] Watts per register count.** `watts = raw × scale`. `1.0` = register in W, `0.1` = 0.1 W, `10.0` = 10 W |
+| `--pct-scale` | **[percent mode] Percent per register count.** `percent = raw × pct-scale`. `1.0` = register in %, `0.01` = 0.01 % |
+| `--target-w` | [watt mode] Setpoint in watts (sign per your inverter; e.g. negative = discharge) |
+| `--target-percent` | [percent mode] Setpoint as % of rated power (sign per your inverter) |
+| `--rated-w` | [percent mode] Known rated power (W) to seed detection; otherwise inferred from the first reaction |
+| `--detect-watts` | [percent mode] Meter change (W) counting as "reacted" before rated power is known (`0` = auto) |
+| `--fraction` | Meter must move by this fraction of the expected change to count as reacted (`0.5` = 50%) |
+| `--infer-timeout` / `--settle-samples` / `--settle-band-frac` | Settle detection used to infer rated power (percent mode) / report achieved power |
+| `--measure-settled` | [watt mode] Also report steady-state achieved power (always on in percent mode) |
 | `--meter-iface` | Local NIC IP to receive the multicast on |
 | `--meter-serial` | Filter to one meter if several are on the network |
 | `--trials` / `--settle` / `--warmup` | Repeat measurements, settle time between, baseline window |
 | `--confirm` | Consecutive crossing samples required (>1 rejects noise spikes) |
-| `--no-reset` / `--reset-value` | By default the setpoint is written back to 0 W after each trial |
+| `--no-reset` / `--reset-value` | By default the setpoint is written back to `0` (W or %) after each trial |
 
 ## Measurement resolution
 

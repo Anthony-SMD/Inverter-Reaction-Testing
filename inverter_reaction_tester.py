@@ -62,7 +62,29 @@ Examples
   # 3) Five trials, store everything in a JSON config instead of long CLI
   python inverter_reaction_tester.py --config my_setup.json --trials 5
 
+  # 4) Percent-of-rated inverter: command 50% and infer the rated power.
+  #    e.g. a U16 register in 0.01% units (write 5000 for 50%) -> --pct-scale 0.01
+  python inverter_reaction_tester.py \
+      --inv-host 192.168.1.20 --inv-unit 3 --inv-register 40023 \
+      --mode percent --datatype U16 --pct-scale 0.01 \
+      --target-percent -50 --meter-iface 192.168.1.50 --trials 5
+
 CLI options always override values from --config.
+
+------------------------------------------------------------------------------
+Setpoint modes
+------------------------------------------------------------------------------
+  watt    (default) -- you give --target-w in watts. The reaction is detected when
+          the meter moves by --fraction (default 50%) of |target_w|.
+
+  percent           -- you give --target-percent (% of rated power). Because the
+          watts are unknown up front, the FIRST reaction is detected against an
+          absolute floor above the meter noise (--detect-watts, 0 = auto). After the
+          inverter reacts the tool waits for the meter to settle, then infers
+              rated_power = |settled change at meter| / (percent / 100)
+          That rated power is reused for the rest of the session: later trials detect
+          against --fraction of the expected change, just like watt mode. Pass a known
+          --rated-w to use proper thresholds from the very first trial.
 """
 
 import argparse
@@ -247,16 +269,16 @@ DATA_TYPES = {
 }
 
 
-def watts_to_raw(watts, scale):
-    """Convert a watt value to the raw register integer.
+def value_to_raw(value, scale):
+    """Convert an engineering value (watts or percent) to the raw register integer.
 
-    `scale` is the value of one register count expressed in watts
-    (i.e. watts = raw * scale).  Examples:
-        register in 1 W     -> scale = 1.0
-        register in 0.1 W   -> scale = 0.1
-        register in 10 W    -> scale = 10.0
+    `scale` is the value of one register count in engineering units
+    (i.e. value = raw * scale).  Examples:
+        register in 1 W   -> scale = 1.0      register in 1 %    -> scale = 1.0
+        register in 0.1 W -> scale = 0.1      register in 0.01 % -> scale = 0.01
+        register in 10 W  -> scale = 10.0     register in 0.1 %  -> scale = 0.1
     """
-    return int(round(watts / scale))
+    return int(round(value / scale))
 
 
 def encode_value(raw, data_type, word_order):
@@ -265,7 +287,7 @@ def encode_value(raw, data_type, word_order):
     if raw < lo or raw > hi:
         raise ValueError(
             f"raw value {raw} is out of range for {data_type} [{lo}, {hi}]. "
-            f"Check --scale / --target-w / --datatype."
+            f"Check --scale/--pct-scale, the target, and --datatype."
         )
     packed = struct.pack(fmt, raw)
     regs = [int.from_bytes(packed[i:i + 2], "big") for i in range(0, len(packed), 2)]
@@ -308,9 +330,27 @@ def mb_write_multi(client, address, values, unit):
         return client.write_registers(address, values, unit=unit)
 
 
-def write_setpoint(client, cfg, watts):
-    """Encode `watts` and write it to the inverter. Returns (raw, regs, response)."""
-    raw = watts_to_raw(watts, cfg["scale"])
+def setpoint_scale(cfg):
+    """Engineering-units-per-register-count for the active mode (W or % per count)."""
+    return cfg["pct_scale"] if cfg["mode"] == "percent" else cfg["scale"]
+
+
+def setpoint_units(cfg):
+    """Unit string for the active setpoint mode."""
+    return "%" if cfg["mode"] == "percent" else "W"
+
+
+def fmt_setpoint(value, mode):
+    """Format a setpoint value for display (whole watts, or %g for percent)."""
+    return f"{value:g}" if mode == "percent" else f"{value:.0f}"
+
+
+def write_setpoint(client, cfg, value):
+    """Encode `value` (watts or percent, per cfg['mode']) and write it.
+
+    Returns (raw, regs, response).
+    """
+    raw = value_to_raw(value, setpoint_scale(cfg))
     regs = encode_value(raw, cfg["datatype"], cfg["word_order"])
     if len(regs) == 1:
         resp = mb_write_single(client, cfg["register"], regs[0], cfg["unit"])
@@ -400,10 +440,53 @@ def detect_reaction(rx, baseline, threshold_w, t0, timeout, confirm):
     return None
 
 
+def measure_settled(rx, baseline, t_start, timeout, settle_samples, band_frac, noise):
+    """After the reaction starts, wait for the meter power to reach steady state.
+
+    Collects samples arriving at/after t_start into a sliding window of
+    `settle_samples`. Power is "settled" once the window's peak-to-peak spread is
+    within max(2*noise, band_frac * |delta-from-baseline|). Returns
+    (settled_net, settled, n): settled_net is the mean of the final window
+    (None if no samples), settled is True if it stabilised before the timeout, and
+    n is how many distinct samples were seen.
+    """
+    from collections import deque
+    window = deque(maxlen=max(1, settle_samples))
+    last_t = None
+    n = 0
+    settled = False
+    deadline = t_start + timeout
+    while time.perf_counter() < deadline:
+        latest = rx.latest()
+        if latest is None or latest[0] == last_t:
+            time.sleep(0.002)
+            continue
+        last_t = latest[0]
+        t, sample, _ = latest
+        if t < t_start:
+            continue
+        window.append(sample["net_power"])
+        n += 1
+        if len(window) == window.maxlen and window.maxlen > 1:
+            delta = abs(statistics.mean(window) - baseline)
+            band = max(2.0 * noise, band_frac * delta)
+            if (max(window) - min(window)) <= band:
+                settled = True
+                break
+    settled_net = statistics.mean(window) if window else None
+    return settled_net, settled, n
+
+
 # --------------------------------------------------------------------------- #
 # One measurement trial
 # --------------------------------------------------------------------------- #
-def run_trial(client, rx, cfg, trial_no, total_trials):
+def run_trial(client, rx, cfg, trial_no, total_trials, session_rated):
+    """Run one trial. `session_rated` is the rated power (W) known so far in percent
+    mode (from --rated-w or inferred in earlier trials), or None if not yet known."""
+    mode = cfg["mode"]
+    units = setpoint_units(cfg)
+    target = cfg["target_percent"] if mode == "percent" else cfg["target_w"]
+
     print(f"\n--- Trial {trial_no}/{total_trials} "
           f"-------------------------------------------------")
 
@@ -413,23 +496,38 @@ def run_trial(client, rx, cfg, trial_no, total_trials):
     if base is None:
         print("  ERROR: no meter samples during warm-up. Aborting trial.")
         return {"ok": False, "reason": "no_meter_data"}
-
     baseline = base["baseline"]
-    threshold = abs(cfg["target_w"]) * cfg["fraction"]
+    noise = base["stdev"]
     res_ms = base["mean_interval"] * 1000.0
+
+    # 2. Detection threshold, expressed in watts at the meter.
+    if mode == "watt":
+        threshold = cfg["fraction"] * abs(cfg["target_w"])
+        thr_note = f"= {cfg['fraction'] * 100:.0f}% of |{cfg['target_w']:.0f} W|"
+    elif session_rated:
+        # Rated power known -> use the same fractional rule as watt mode.
+        expected_w = abs(target) / 100.0 * session_rated
+        threshold = cfg["fraction"] * expected_w
+        thr_note = (f"= {cfg['fraction'] * 100:.0f}% of {abs(target):g}% x "
+                    f"{session_rated:.0f} W rated")
+    else:
+        # Rated power unknown -> absolute floor above the meter noise.
+        floor = cfg["detect_watts"] if cfg["detect_watts"] > 0 else 50.0
+        threshold = max(floor, 4.0 * noise)
+        thr_note = "absolute floor (rated power not known yet)"
+
     print(f"    baseline net power : {baseline:10.1f} W   "
-          f"(noise +/- {base['stdev']:.1f} W over {base['n']} samples)")
+          f"(noise +/- {noise:.1f} W over {base['n']} samples)")
     print(f"    meter update period: {res_ms:8.1f} ms  "
           f"(<- reaction-time resolution)")
-    print(f"    detection threshold: {threshold:10.1f} W   "
-          f"(= {cfg['fraction'] * 100:.0f}% of |{cfg['target_w']:.0f} W|)")
-    if threshold < 3 * base["stdev"]:
+    print(f"    detection threshold: {threshold:10.1f} W   ({thr_note})")
+    if threshold < 3 * noise:
         print("    WARNING: threshold is within ~3x the meter noise -- result may "
-              "false-trigger. Use a larger --target-w or a quieter load.")
+              "false-trigger. Use a larger setpoint or a quieter load.")
 
-    # 2. Write the setpoint  (t0 is captured right after the call returns)
+    # 3. Write the setpoint  (t0 is captured right after the call returns)
     try:
-        raw, regs, resp = write_setpoint(client, cfg, cfg["target_w"])
+        raw, regs, resp = write_setpoint(client, cfg, target)
         t0 = time.perf_counter()
     except ValueError as exc:
         print(f"  ERROR encoding setpoint: {exc}")
@@ -437,55 +535,79 @@ def run_trial(client, rx, cfg, trial_no, total_trials):
     if resp is None or resp.isError():
         print(f"  ERROR: Modbus write failed: {resp}")
         return {"ok": False, "reason": "write_error"}
-    print(f"  Wrote setpoint: {cfg['target_w']:.0f} W  ->  raw {raw}  "
+    print(f"  Wrote setpoint: {fmt_setpoint(target, mode)} {units}  ->  raw {raw}  "
           f"regs {regs}  @ register {cfg['register']}")
 
-    # 3. Read back once to verify (verification only, not used for timing)
+    # 4. Read back once to verify (verification only, not used for timing)
     try:
         rr = mb_read_holding(client, cfg["register"], len(regs), cfg["unit"])
         if rr is None or rr.isError():
             print(f"  WARNING: read-back failed: {rr}")
         else:
             rb_raw = decode_registers(rr.registers, cfg["datatype"], cfg["word_order"])
-            rb_w = rb_raw * cfg["scale"]
+            rb_val = rb_raw * setpoint_scale(cfg)
             ok = "OK" if rb_raw == raw else "MISMATCH"
-            print(f"  Read back     : {rb_w:.0f} W  (raw {rb_raw})  [{ok}]")
+            print(f"  Read back     : {fmt_setpoint(rb_val, mode)} {units}  "
+                  f"(raw {rb_raw})  [{ok}]")
     except Exception as exc:               # noqa: BLE001
         print(f"  WARNING: read-back error: {exc}")
 
-    # 4. Watch the meter for the reaction (only the meter is read here)
+    # 5. Watch the meter for the reaction (only the meter is read here)
     print(f"  Waiting for meter to react (timeout {cfg['timeout']:.1f}s) ...")
     hit = detect_reaction(rx, baseline, threshold, t0, cfg["timeout"], cfg["confirm"])
 
-    result = {"ok": False, "baseline": baseline, "threshold": threshold,
-              "resolution_ms": res_ms}
+    result = {"ok": False, "mode": mode, "baseline": baseline,
+              "threshold": threshold, "resolution_ms": res_ms}
     if hit is None:
         print(f"  TIMEOUT: meter did not move by {threshold:.0f} W within "
               f"{cfg['timeout']:.1f}s. Inverter did not react (or needs an "
               f"external-control-enable register set first).")
         result["reason"] = "timeout"
-    else:
-        t1, sample, delta = hit
-        reaction_ms = (t1 - t0) * 1000.0
-        direction = "import+" if delta > 0 else "export+"
-        print(f"  REACTED: meter net power = {sample['net_power']:.1f} W "
-              f"(delta {delta:+.1f} W, {direction})")
-        print(f"  >> Reaction time = {reaction_ms:.1f} ms "
-              f"(+/- ~{res_ms:.0f} ms meter resolution)")
-        result.update({"ok": True, "reaction_ms": reaction_ms,
-                       "delta": delta, "net_power": sample["net_power"]})
+        return result
+
+    t1, sample, delta = hit
+    reaction_ms = (t1 - t0) * 1000.0
+    direction = "import+" if delta > 0 else "export+"
+    print(f"  REACTED: meter net power = {sample['net_power']:.1f} W "
+          f"(delta {delta:+.1f} W, {direction})")
+    print(f"  >> Reaction time = {reaction_ms:.1f} ms "
+          f"(+/- ~{res_ms:.0f} ms meter resolution)")
+    result.update({"ok": True, "reaction_ms": reaction_ms,
+                   "delta": delta, "net_power": sample["net_power"]})
+
+    # 6. Settle, then (in percent mode) infer rated power from the full reaction.
+    if mode == "percent" or cfg["measure_settled"]:
+        print(f"  Measuring settled power (timeout {cfg['infer_timeout']:.1f}s) ...")
+        settled_net, settled, n = measure_settled(
+            rx, baseline, t1, cfg["infer_timeout"],
+            cfg["settle_samples"], cfg["settle_band_frac"], noise)
+        if settled_net is None:
+            print("    WARNING: no samples while settling; cannot measure.")
+        else:
+            settled_delta = settled_net - baseline
+            tag = "settled" if settled else "NOT fully settled (hit timeout)"
+            print(f"    settled net power  : {settled_net:10.1f} W   "
+                  f"(delta {settled_delta:+.1f} W, {tag}, {n} samples)")
+            result.update({"settled": settled, "settled_delta": settled_delta})
+            if mode == "percent":
+                rated = abs(settled_delta) / (abs(target) / 100.0)
+                result["rated_power"] = rated
+                print(f"    >> Inferred rated power = {rated:.0f} W "
+                      f"(from {abs(target):g}% command)")
 
     return result
 
 
 def reset_inverter(client, cfg):
     """Write the reset/idle setpoint back to the inverter."""
+    units = setpoint_units(cfg)
     try:
         raw, regs, resp = write_setpoint(client, cfg, cfg["reset_value"])
         if resp is None or resp.isError():
             print(f"  WARNING: reset write failed: {resp}")
         else:
-            print(f"  Reset setpoint to {cfg['reset_value']:.0f} W (raw {raw}).")
+            print(f"  Reset setpoint to {fmt_setpoint(cfg['reset_value'], cfg['mode'])} "
+                  f"{units} (raw {raw}).")
     except Exception as exc:               # noqa: BLE001
         print(f"  WARNING: reset write error: {exc}")
 
@@ -561,19 +683,34 @@ def build_config():
                    default=d("word_order", "big"),
                    help="word order for 32-bit values (big = high word first)")
     g.add_argument("--scale", type=float, default=d("scale", 1.0),
-                   help="watts per register count (watts = raw * scale): "
+                   help="[watt mode] watts per register count (watts = raw * scale): "
                         "1.0 for W, 0.1 for 0.1 W, 10.0 for 10 W")
+    g.add_argument("--pct-scale", type=float, default=d("pct_scale", 1.0),
+                   help="[percent mode] percent per register count "
+                        "(percent = raw * pct_scale): 1.0 for 1%%, 0.01 for 0.01%%")
     g.add_argument("--modbus-timeout", type=float, default=d("modbus_timeout", 3.0),
                    help="Modbus TCP socket timeout (s)")
 
     # Setpoint / detection
     g = p.add_argument_group("setpoint / detection")
+    g.add_argument("--mode", choices=["watt", "percent"], default=d("mode", "watt"),
+                   help="setpoint units: 'watt' writes --target-w; 'percent' writes "
+                        "--target-percent and infers rated power from the reaction")
     g.add_argument("--target-w", type=float, default=d("target_w", None),
-                   help="power setpoint to write, in watts "
+                   help="[watt mode] power setpoint in watts "
                         "(sign per inverter convention, e.g. negative = discharge)")
+    g.add_argument("--target-percent", type=float, default=d("target_percent", None),
+                   help="[percent mode] setpoint as %% of rated power "
+                        "(sign per inverter convention)")
+    g.add_argument("--rated-w", type=float, default=d("rated_w", None),
+                   help="[percent mode] known rated power (W) to seed detection; "
+                        "if omitted it is inferred from the first reaction")
+    g.add_argument("--detect-watts", type=float, default=d("detect_watts", 0.0),
+                   help="[percent mode] meter change (W) counting as 'reacted' before "
+                        "rated power is known (0 = auto: max(50, 4x meter noise))")
     g.add_argument("--fraction", type=float, default=d("fraction", 0.5),
-                   help="meter must move by this fraction of |target_w| to count "
-                        "as 'reacted' (0.5 = 50%%)")
+                   help="meter must move by this fraction of the expected change to "
+                        "count as 'reacted' (0.5 = 50%%)")
     g.add_argument("--timeout", type=float, default=d("timeout", 10.0),
                    help="max time to wait for a reaction (s)")
     g.add_argument("--confirm", type=int, default=d("confirm", 1),
@@ -607,7 +744,23 @@ def build_config():
     g.add_argument("--no-reset", action="store_true", default=d("no_reset", False),
                    help="do NOT write the reset value after each trial")
     g.add_argument("--reset-value", type=float, default=d("reset_value", 0.0),
-                   help="setpoint (W) written after each trial when resetting")
+                   help="setpoint written after each trial when resetting, in the "
+                        "active mode's units (W or %%)")
+
+    # Settle / rated-power inference
+    g = p.add_argument_group("settle / rated-power inference")
+    g.add_argument("--measure-settled", action="store_true",
+                   default=d("measure_settled", False),
+                   help="also measure steady-state power after reacting "
+                        "(always on, and required, in --mode percent)")
+    g.add_argument("--infer-timeout", type=float, default=d("infer_timeout", 8.0),
+                   help="max time to wait for power to settle after reacting (s)")
+    g.add_argument("--settle-samples", type=int, default=d("settle_samples", 3),
+                   help="meter samples that must agree before declaring 'settled'")
+    g.add_argument("--settle-band-frac", type=float,
+                   default=d("settle_band_frac", 0.05),
+                   help="settled when the sample-window spread is within this fraction "
+                        "of the change (and above meter noise)")
 
     # Modes
     g = p.add_argument_group("modes")
@@ -620,14 +773,20 @@ def build_config():
         "inv_host": args.inv_host, "inv_port": args.inv_port,
         "unit": args.inv_unit, "register": args.inv_register,
         "datatype": args.datatype, "word_order": args.word_order,
-        "scale": args.scale, "modbus_timeout": args.modbus_timeout,
-        "target_w": args.target_w, "fraction": args.fraction,
+        "scale": args.scale, "pct_scale": args.pct_scale,
+        "modbus_timeout": args.modbus_timeout,
+        "mode": args.mode, "target_w": args.target_w,
+        "target_percent": args.target_percent, "rated_w": args.rated_w,
+        "detect_watts": args.detect_watts, "fraction": args.fraction,
         "timeout": args.timeout, "confirm": args.confirm,
         "meter_group": args.meter_group, "meter_port": args.meter_port,
         "meter_iface": args.meter_iface, "meter_serial": args.meter_serial,
         "meter_src_ip": args.meter_src_ip, "meter_timeout": args.meter_timeout,
         "warmup": args.warmup, "trials": args.trials, "settle": args.settle,
         "reset": not args.no_reset, "reset_value": args.reset_value,
+        "measure_settled": args.measure_settled,
+        "infer_timeout": args.infer_timeout, "settle_samples": args.settle_samples,
+        "settle_band_frac": args.settle_band_frac,
         "monitor": args.monitor,
     }
     return cfg
@@ -642,12 +801,20 @@ def validate_config(cfg):
             errors.append("--inv-host is required (or set inv_host in --config)")
         if cfg["register"] is None:
             errors.append("--inv-register is required (or set inv_register in --config)")
-        if cfg["target_w"] is None:
-            errors.append("--target-w is required (or set target_w in --config)")
-        elif cfg["target_w"] == 0:
-            errors.append("--target-w must be non-zero")
-        if cfg["scale"] == 0:
-            errors.append("--scale must be non-zero")
+        if cfg["mode"] == "watt":
+            if cfg["target_w"] is None:
+                errors.append("--target-w is required in watt mode")
+            elif cfg["target_w"] == 0:
+                errors.append("--target-w must be non-zero")
+            if cfg["scale"] == 0:
+                errors.append("--scale must be non-zero")
+        else:  # percent
+            if cfg["target_percent"] is None:
+                errors.append("--target-percent is required in percent mode")
+            elif cfg["target_percent"] == 0:
+                errors.append("--target-percent must be non-zero")
+            if cfg["pct_scale"] == 0:
+                errors.append("--pct-scale must be non-zero")
         if not 0 < cfg["fraction"] <= 1:
             errors.append("--fraction must be in (0, 1]")
         if cfg["confirm"] < 1:
@@ -660,12 +827,21 @@ def print_header(cfg):
     print(" Inverter reaction-time tester")
     print("=" * 66)
     if not cfg["monitor"]:
+        scale_txt = (f"{cfg['pct_scale']} %/count" if cfg["mode"] == "percent"
+                     else f"{cfg['scale']} W/count")
         print(f" Inverter : {cfg['inv_host']}:{cfg['inv_port']} unit {cfg['unit']}  "
               f"register {cfg['register']}  {cfg['datatype']}/{cfg['word_order']}  "
-              f"scale {cfg['scale']} W/count")
-        print(f" Setpoint : {cfg['target_w']:.0f} W   detect at "
-              f"{cfg['fraction'] * 100:.0f}% change   timeout {cfg['timeout']:.0f}s   "
-              f"trials {cfg['trials']}")
+              f"{scale_txt}")
+        if cfg["mode"] == "percent":
+            seed = (f"rated seed {cfg['rated_w']:.0f} W" if cfg["rated_w"]
+                    else "rated power inferred from reaction")
+            print(f" Setpoint : {cfg['target_percent']:g} % of rated  ({seed})   "
+                  f"detect at {cfg['fraction'] * 100:.0f}% change   "
+                  f"timeout {cfg['timeout']:.0f}s   trials {cfg['trials']}")
+        else:
+            print(f" Setpoint : {cfg['target_w']:.0f} W   detect at "
+                  f"{cfg['fraction'] * 100:.0f}% change   timeout {cfg['timeout']:.0f}s   "
+                  f"trials {cfg['trials']}")
     print(f" Meter    : Speedwire multicast {cfg['meter_group']}:{cfg['meter_port']}"
           + (f"  iface {cfg['meter_iface']}" if cfg["meter_iface"] else "")
           + (f"  serial {cfg['meter_serial']}" if cfg["meter_serial"] else ""))
@@ -686,6 +862,13 @@ def print_summary(results):
         print(f"  max  reaction : {max(times):8.1f} ms")
         if len(times) > 1:
             print(f"  stdev         : {statistics.stdev(times):8.1f} ms")
+    rated = [r["rated_power"] for r in results if r.get("rated_power")]
+    if rated:
+        print(f"  --- inferred rated power ({len(rated)} trial(s)) ---")
+        print(f"  mean rated    : {statistics.mean(rated):8.0f} W")
+        print(f"  min / max     : {min(rated):.0f} / {max(rated):.0f} W")
+        if len(rated) > 1:
+            print(f"  stdev         : {statistics.stdev(rated):8.0f} W")
     print("=" * 66)
 
 
@@ -733,8 +916,15 @@ def main():
             return 1
 
         results = []
+        inferred = []          # rated powers inferred so far (percent mode)
         for n in range(1, cfg["trials"] + 1):
-            results.append(run_trial(client, rx, cfg, n, cfg["trials"]))
+            # In percent mode, seed detection with the rated power known so far:
+            # an explicit --rated-w, else the running mean of earlier inferences.
+            session_rated = statistics.mean(inferred) if inferred else cfg["rated_w"]
+            res = run_trial(client, rx, cfg, n, cfg["trials"], session_rated)
+            if res.get("rated_power"):
+                inferred.append(res["rated_power"])
+            results.append(res)
             if cfg["reset"]:
                 reset_inverter(client, cfg)
             if n < cfg["trials"]:
