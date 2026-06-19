@@ -1,5 +1,5 @@
 {
-  "_comment": "Default field config: percent-of-rated-power inverter at 192.168.101.28. Register 1111 holds the setpoint as %, pct_scale 0.1 means 100% = raw 1000 (so 10% = raw 100). Rated power is inferred from the meter reaction. Meter is received on the default network interface. Override any value on the CLI, e.g. ./run.sh --config default_config.json --target-percent -10",
+  "_comment": "Default field config: percent-of-rated-power inverter at 192.168.101.28. Register 1111 holds the setpoint as %, pct_scale 0.1 means 100% = raw 1000 (so 10% = raw 100). Rated power is inferred from the meter reaction. Meter is received on the default network interface. If multiple SMA meters are on the network, run './run.sh --monitor' to list them, then set meter_src_ip (by IP) or meter_serial to target one. Override any value on the CLI, e.g. ./run.sh --config default_config.json --target-percent -10 --meter-src-ip 192.168.101.42",
 
   "inv_host": "192.168.101.28",
   "inv_port": 503,

@@ -130,6 +130,31 @@ python inverter_reaction_tester.py --monitor --meter-iface 192.168.1.50
 
 You should see live `net / import / export` watt readings. If not, see Troubleshooting.
 
+## Picking the right meter (multiple on the network)
+
+If several SMA meters broadcast on the network, **monitor mode lists each one** as it
+appears, with the exact flag to lock onto it:
+
+```bash
+./run.sh --monitor
+```
+
+```
+>>> meter detected: 192.168.101.42   serial 1234567890   ->  filter with:  --meter-src-ip 192.168.101.42  (or --meter-serial 1234567890)
+  net      210.5 W   import    210.5 W   export      0.0 W   serial 1234567890   from 192.168.101.42
+```
+
+Then pin the test to that meter by IP:
+
+```bash
+./run.sh --config default_config.json --meter-src-ip 192.168.101.42
+```
+
+or set `"meter_src_ip": "192.168.101.42"` in your config. You can filter by **serial**
+instead (`--meter-serial` / `"meter_serial"`), which survives DHCP IP changes. If you
+run a test with multiple meters present and no filter set, the tool **warns you** — an
+unfiltered baseline and detection would mix readings from different meters.
+
 ## Run a reaction test
 
 ```
@@ -201,7 +226,8 @@ register in `0.01 %` (write `5000` for 50 %) → `--pct-scale 0.01`. See
 | `--infer-timeout` / `--settle-samples` / `--settle-band-frac` | Settle detection used to infer rated power (percent mode) / report achieved power |
 | `--measure-settled` | [watt mode] Also report steady-state achieved power (always on in percent mode) |
 | `--meter-iface` | Local NIC IP to receive the multicast on |
-| `--meter-serial` | Filter to one meter if several are on the network |
+| `--meter-src-ip` | **Filter to one meter by its IP** — use when several meters are on the network |
+| `--meter-serial` | Filter to one meter by serial number (survives DHCP IP changes) |
 | `--trials` / `--settle` / `--warmup` | Repeat measurements, settle time between, baseline window |
 | `--confirm` | Consecutive crossing samples required (>1 rejects noise spikes) |
 | `--no-reset` / `--reset-value` | By default the setpoint is written back to `0` (W or %) after each trial |

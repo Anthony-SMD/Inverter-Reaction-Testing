@@ -321,6 +321,7 @@ class MeterReceiver(threading.Thread):
         self._lock = threading.Lock()
         self._latest = None           # (t_perf, sample_dict, src_ip)
         self._count = 0
+        self._sources = {}            # every meter seen on the wire: src_ip -> serial
         self._sock = None
         self.error = None
 
@@ -354,17 +355,22 @@ class MeterReceiver(threading.Thread):
                 continue
             except OSError:
                 break
-            t = time.perf_counter()
-            if self.src_ip_filter and addr[0] != self.src_ip_filter:
-                continue
-            sample = parse_sma_em(data)
-            if sample is None:
-                continue
-            if self.serial_filter and sample["serial"] != self.serial_filter:
-                continue
-            with self._lock:
-                self._latest = (t, sample, addr[0])
-                self._count += 1
+            self._handle(data, addr[0], time.perf_counter())
+
+    def _handle(self, data, src_ip, t):
+        """Parse one datagram, record its meter, and store it if it passes filters."""
+        sample = parse_sma_em(data)
+        if sample is None:
+            return
+        with self._lock:
+            self._sources[src_ip] = sample["serial"]   # record every meter seen
+        if self.src_ip_filter and src_ip != self.src_ip_filter:
+            return
+        if self.serial_filter and sample["serial"] != self.serial_filter:
+            return
+        with self._lock:
+            self._latest = (t, sample, src_ip)
+            self._count += 1
 
     def latest(self):
         with self._lock:
@@ -373,6 +379,11 @@ class MeterReceiver(threading.Thread):
     def count(self):
         with self._lock:
             return self._count
+
+    def sources(self):
+        """Return {src_ip: serial} for every meter seen on the wire (any filter)."""
+        with self._lock:
+            return dict(self._sources)
 
     def stop(self):
         self._stop.set()
@@ -642,6 +653,17 @@ def run_trial(client, rx, cfg, trial_no, total_trials, session_rated):
         print("    WARNING: threshold is within ~3x the meter noise -- result may "
               "false-trigger. Use a larger setpoint or a quieter load.")
 
+    # On trial 1, warn if several meters are broadcasting but none was selected --
+    # an unfiltered baseline/detection would mix readings from different meters.
+    if trial_no == 1 and not (cfg["meter_src_ip"] or cfg["meter_serial"]):
+        srcs = rx.sources()
+        if len(srcs) > 1:
+            print("    WARNING: multiple meters seen on the network --")
+            for ip, serial in sorted(srcs.items()):
+                print(f"               {ip}  (serial {serial})")
+            print("             readings are being MIXED. Pick one with "
+                  "--meter-src-ip <IP> or --meter-serial <SN>.")
+
     # 3. Write the setpoint  (t0 is captured right after the call returns)
     try:
         raw, regs, resp = write_setpoint(client, cfg, target)
@@ -733,7 +755,8 @@ def reset_inverter(client, cfg):
 # Monitor mode
 # --------------------------------------------------------------------------- #
 def run_monitor(rx, meter_timeout):
-    print("Monitor mode - press Ctrl+C to stop.\n")
+    print("Monitor mode - press Ctrl+C to stop.")
+    print("Each distinct meter is announced as it appears; live readings follow.\n")
     first = wait_first_sample(rx, meter_timeout)
     if rx.error:
         print(f"ERROR opening meter socket: {rx.error}")
@@ -741,8 +764,15 @@ def run_monitor(rx, meter_timeout):
     if first is None:
         print_no_meter_help(meter_timeout)
         return 1
+    announced = set()
     last_t = None
     while True:
+        # Announce any newly seen meter, with the flag to lock onto it.
+        for ip, serial in sorted(rx.sources().items()):
+            if ip not in announced:
+                announced.add(ip)
+                print(f">>> meter detected: {ip}   serial {serial}   "
+                      f"->  filter with:  --meter-src-ip {ip}  (or --meter-serial {serial})")
         latest = rx.latest()
         if latest is not None and latest[0] != last_t:
             last_t = latest[0]
@@ -959,7 +989,10 @@ def print_header(cfg):
                   f"trials {cfg['trials']}")
     print(f" Meter    : Speedwire multicast {cfg['meter_group']}:{cfg['meter_port']}"
           + (f"  iface {cfg['meter_iface']}" if cfg["meter_iface"] else "")
-          + (f"  serial {cfg['meter_serial']}" if cfg["meter_serial"] else ""))
+          + (f"  src-ip {cfg['meter_src_ip']}" if cfg["meter_src_ip"] else "")
+          + (f"  serial {cfg['meter_serial']}" if cfg["meter_serial"] else "")
+          + ("  (no meter filter)" if not (cfg["meter_src_ip"] or cfg["meter_serial"]
+                                           or cfg["monitor"]) else ""))
     print("=" * 66)
 
 
