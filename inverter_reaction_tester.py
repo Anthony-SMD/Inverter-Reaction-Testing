@@ -54,6 +54,9 @@ Examples
   # 1) Sanity check: just watch the meter net power
   python inverter_reaction_tester.py --monitor --meter-iface 192.168.1.50
 
+  # 1b) Comms check: confirm meter reception AND read the inverter (writes nothing)
+  python inverter_reaction_tester.py --config my_setup.json --probe
+
   # 2) Single reaction test: discharge 3000 W, S32 register at addr 40149,
   #    register units are 1 W (scale 1.0)
   python inverter_reaction_tester.py \
@@ -487,6 +490,24 @@ def write_setpoint(client, cfg, value):
     return raw, regs, resp
 
 
+def probe_inverter(client, cfg):
+    """Read the setpoint register once to confirm inverter comms. Writes nothing.
+
+    Returns {"ok": True, "raw": int, "value": float, "regs": list} on success,
+    or {"ok": False, "error": str} on failure.
+    """
+    _, nreg, _ = DATA_TYPES[cfg["datatype"]]
+    try:
+        rr = mb_read_holding(client, cfg["register"], nreg, cfg["unit"])
+    except Exception as exc:               # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+    if rr is None or rr.isError():
+        return {"ok": False, "error": str(rr)}
+    raw = decode_registers(rr.registers, cfg["datatype"], cfg["word_order"])
+    return {"ok": True, "raw": raw, "value": raw * setpoint_scale(cfg),
+            "regs": list(rr.registers)}
+
+
 # --------------------------------------------------------------------------- #
 # Meter sampling helpers
 # --------------------------------------------------------------------------- #
@@ -783,6 +804,53 @@ def run_monitor(rx, meter_timeout):
         time.sleep(0.05)
 
 
+def run_probe(rx, cfg):
+    """Read-only comms check: meter reception + inverter register read. No writes."""
+    print("Probe mode - read-only comms check (no setpoint is written).\n")
+
+    # --- meter ---
+    first = wait_first_sample(rx, cfg["meter_timeout"])
+    meter_ok = bool(first) and rx.error is None
+    if rx.error:
+        print(f"  meter   : FAIL - error opening socket: {rx.error}")
+    elif first is None:
+        print(f"  meter   : FAIL - no datagrams in {cfg['meter_timeout']:.0f}s")
+    else:
+        time.sleep(1.5)                    # let any other meters announce themselves
+        srcs = rx.sources()
+        print(f"  meter   : OK - {len(srcs)} meter(s) seen")
+        for ip, serial in sorted(srcs.items()):
+            sel = "  <- selected" if (cfg["meter_src_ip"] == ip
+                                      or cfg["meter_serial"] == serial) else ""
+            print(f"              {ip}  (serial {serial}){sel}")
+
+    # --- inverter ---
+    client, backend = make_modbus_client(cfg["inv_host"], cfg["inv_port"],
+                                         cfg["modbus_timeout"])
+    inv_ok = False
+    if not client.connect():
+        print(f"  inverter: FAIL - cannot connect to "
+              f"{cfg['inv_host']}:{cfg['inv_port']} ({backend})")
+    else:
+        probe = probe_inverter(client, cfg)
+        client.close()
+        if probe["ok"]:
+            inv_ok = True
+            units = setpoint_units(cfg)
+            print(f"  inverter: READ OK ({backend}) - register {cfg['register']} = "
+                  f"{fmt_setpoint(probe['value'], cfg['mode'])} {units} "
+                  f"(raw {probe['raw']}, regs {probe['regs']})")
+        else:
+            print(f"  inverter: READ FAILED ({backend}) - register "
+                  f"{cfg['register']}: {probe['error']}")
+            print("              check --inv-unit / --inv-register / --inv-port; "
+                  "if the register is write-only, a real run needs --skip-read-test")
+
+    ok = meter_ok and inv_ok
+    print(f"\nComms check: {'PASS - ready to run a test' if ok else 'FAIL'}")
+    return 0 if ok else 1
+
+
 def print_no_meter_help(timeout):
     print(f"\nERROR: no SMA energy-meter datagrams received in {timeout:.0f}s.\n"
           "  - Is this PC on the same LAN/VLAN as the meter?\n"
@@ -837,6 +905,10 @@ def build_config():
                         "(percent = raw * pct_scale): 1.0 for 1%%, 0.01 for 0.01%%")
     g.add_argument("--modbus-timeout", type=float, default=d("modbus_timeout", 3.0),
                    help="Modbus TCP socket timeout (s)")
+    g.add_argument("--skip-read-test", action="store_true",
+                   default=d("skip_read_test", False),
+                   help="skip the pre-write read check (use only if the setpoint "
+                        "register is write-only)")
 
     # Setpoint / detection
     g = p.add_argument_group("setpoint / detection")
@@ -913,6 +985,9 @@ def build_config():
     g = p.add_argument_group("modes")
     g.add_argument("--monitor", action="store_true", default=d("monitor", False),
                    help="just print live meter net power, then exit (no inverter)")
+    g.add_argument("--probe", action="store_true", default=d("probe", False),
+                   help="read-only comms check: confirm meter reception and read the "
+                        "inverter register, then exit (writes nothing)")
 
     args = p.parse_args()
 
@@ -921,7 +996,8 @@ def build_config():
         "unit": args.inv_unit, "register": args.inv_register,
         "datatype": args.datatype, "word_order": args.word_order,
         "scale": args.scale, "pct_scale": args.pct_scale,
-        "modbus_timeout": args.modbus_timeout,
+        "modbus_timeout": args.modbus_timeout, "skip_read_test": args.skip_read_test,
+        "probe": args.probe,
         "mode": args.mode, "target_w": args.target_w,
         "target_percent": args.target_percent, "rated_w": args.rated_w,
         "detect_watts": args.detect_watts, "fraction": args.fraction,
@@ -941,29 +1017,36 @@ def build_config():
 
 def validate_config(cfg):
     errors = []
-    if not cfg["monitor"]:
-        if not cfg["inv_host"]:
-            errors.append("--inv-host is required (or set inv_host in --config)")
-        if cfg["register"] is None:
-            errors.append("--inv-register is required (or set inv_register in --config)")
-        if cfg["mode"] == "watt":
-            if cfg["target_w"] is None:
-                errors.append("--target-w is required in watt mode")
-            elif cfg["target_w"] == 0:
-                errors.append("--target-w must be non-zero")
-            if cfg["scale"] == 0:
-                errors.append("--scale must be non-zero")
-        else:  # percent
-            if cfg["target_percent"] is None:
-                errors.append("--target-percent is required in percent mode")
-            elif cfg["target_percent"] == 0:
-                errors.append("--target-percent must be non-zero")
-            if cfg["pct_scale"] == 0:
-                errors.append("--pct-scale must be non-zero")
-        if not 0 < cfg["fraction"] <= 1:
-            errors.append("--fraction must be in (0, 1]")
-        if cfg["confirm"] < 1:
-            errors.append("--confirm must be >= 1")
+    if cfg["monitor"]:
+        return errors                       # meter-only; no inverter needed
+
+    # The inverter is needed for both a probe and a real test.
+    if not cfg["inv_host"]:
+        errors.append("--inv-host is required (or set inv_host in --config)")
+    if cfg["register"] is None:
+        errors.append("--inv-register is required (or set inv_register in --config)")
+    if cfg["probe"]:
+        return errors                       # probe only reads; no setpoint needed
+
+    # Full test: a setpoint is written.
+    if cfg["mode"] == "watt":
+        if cfg["target_w"] is None:
+            errors.append("--target-w is required in watt mode")
+        elif cfg["target_w"] == 0:
+            errors.append("--target-w must be non-zero")
+        if cfg["scale"] == 0:
+            errors.append("--scale must be non-zero")
+    else:  # percent
+        if cfg["target_percent"] is None:
+            errors.append("--target-percent is required in percent mode")
+        elif cfg["target_percent"] == 0:
+            errors.append("--target-percent must be non-zero")
+        if cfg["pct_scale"] == 0:
+            errors.append("--pct-scale must be non-zero")
+    if not 0 < cfg["fraction"] <= 1:
+        errors.append("--fraction must be in (0, 1]")
+    if cfg["confirm"] < 1:
+        errors.append("--confirm must be >= 1")
     return errors
 
 
@@ -977,7 +1060,9 @@ def print_header(cfg):
         print(f" Inverter : {cfg['inv_host']}:{cfg['inv_port']} unit {cfg['unit']}  "
               f"register {cfg['register']}  {cfg['datatype']}/{cfg['word_order']}  "
               f"{scale_txt}")
-        if cfg["mode"] == "percent":
+        if cfg["probe"]:
+            print(" Mode     : PROBE - read-only comms check, no setpoint is written")
+        elif cfg["mode"] == "percent":
             seed = (f"rated seed {cfg['rated_w']:.0f} W" if cfg["rated_w"]
                     else "rated power inferred from reaction")
             print(f" Setpoint : {cfg['target_percent']:g} % of rated  ({seed})   "
@@ -992,7 +1077,7 @@ def print_header(cfg):
           + (f"  src-ip {cfg['meter_src_ip']}" if cfg["meter_src_ip"] else "")
           + (f"  serial {cfg['meter_serial']}" if cfg["meter_serial"] else "")
           + ("  (no meter filter)" if not (cfg["meter_src_ip"] or cfg["meter_serial"]
-                                           or cfg["monitor"]) else ""))
+                                           or cfg["monitor"] or cfg["probe"]) else ""))
     print("=" * 66)
 
 
@@ -1043,6 +1128,8 @@ def main():
     try:
         if cfg["monitor"]:
             return run_monitor(rx, cfg["meter_timeout"])
+        if cfg["probe"]:
+            return run_probe(rx, cfg)
 
         # Confirm the meter is actually delivering data before touching the inverter.
         print(f"\nWaiting for first meter datagram (timeout "
@@ -1063,6 +1150,23 @@ def main():
             print(f"ERROR: could not connect to inverter at "
                   f"{cfg['inv_host']}:{cfg['inv_port']}")
             return 1
+
+        # Pre-write comms check: confirm we can READ the inverter before writing.
+        if cfg["skip_read_test"]:
+            print("Inverter read test skipped (--skip-read-test).")
+        else:
+            probe = probe_inverter(client, cfg)
+            if not probe["ok"]:
+                print(f"ERROR: cannot read inverter register {cfg['register']}: "
+                      f"{probe['error']}")
+                print("  - Check --inv-unit (slave id), --inv-register and --inv-port.")
+                print("  - If this register is write-only, re-run with --skip-read-test.")
+                print("  Refusing to write a setpoint until a read succeeds.")
+                return 1
+            units = setpoint_units(cfg)
+            print(f"Inverter read OK: register {cfg['register']} currently = "
+                  f"{fmt_setpoint(probe['value'], cfg['mode'])} {units} "
+                  f"(raw {probe['raw']}).")
 
         results = []
         inferred = []          # rated powers inferred so far (percent mode)

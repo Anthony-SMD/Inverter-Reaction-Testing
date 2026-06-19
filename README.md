@@ -16,8 +16,9 @@ git clone https://github.com/Anthony-SMD/Inverter-Reaction-Testing.git
 cd Inverter-Reaction-Testing
 bash install.sh                     # builds ./.venv and installs pymodbus (once)
 
-./run.sh --monitor                  # 1) confirm the SMA meter is being received
-./run.sh --config default_config.json   # 2) run the reaction test
+./run.sh --monitor                            # 1) confirm the SMA meter is heard
+./run.sh --config default_config.json --probe # 2) comms check: read the inverter (no write)
+./run.sh --config default_config.json         # 3) run the reaction test
 ```
 
 `install.sh` creates a self-contained `./.venv` (so it works on modern Debian/Ubuntu/
@@ -155,6 +156,23 @@ instead (`--meter-serial` / `"meter_serial"`), which survives DHCP IP changes. I
 run a test with multiple meters present and no filter set, the tool **warns you** — an
 unfiltered baseline and detection would mix readings from different meters.
 
+## Comms checks before writing
+
+Before any setpoint is written, every run **reads the inverter register first** and
+aborts if that read fails — so a wrong unit id, register, or port is caught *before*
+the inverter is ever commanded. (`--monitor` already does the same for the meter.)
+
+For a standalone, read-only comms check that writes nothing:
+
+```bash
+./run.sh --config default_config.json --probe
+```
+
+It confirms meter reception (listing the meters seen) and reads the setpoint register,
+printing its current value — a quick "am I ready to run a test?" check. If your
+setpoint register is genuinely write-only, the pre-write read would always fail; use
+`--skip-read-test` on the real run to bypass it.
+
 ## Run a reaction test
 
 ```
@@ -231,6 +249,8 @@ register in `0.01 %` (write `5000` for 50 %) → `--pct-scale 0.01`. See
 | `--trials` / `--settle` / `--warmup` | Repeat measurements, settle time between, baseline window |
 | `--confirm` | Consecutive crossing samples required (>1 rejects noise spikes) |
 | `--no-reset` / `--reset-value` | By default the setpoint is written back to `0` (W or %) after each trial |
+| `--probe` | Read-only comms check: read the inverter register and confirm meter reception, then exit (writes nothing) |
+| `--skip-read-test` | Skip the automatic pre-write read check (only if the setpoint register is write-only) |
 
 ## Measurement resolution
 
