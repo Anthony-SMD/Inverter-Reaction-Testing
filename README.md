@@ -24,6 +24,11 @@ bash install.sh                     # builds ./.venv and installs pymodbus (once
 `install.sh` creates a self-contained `./.venv` (so it works on modern Debian/Ubuntu/
 Fedora, which block system-wide `pip install`). `run.sh` runs the tool through that venv.
 
+**First time, or no config yet?** Just run `./run.sh` with no arguments for a **guided
+setup** — it prompts for each setting one at a time, checks the inverter and meter
+comms before anything is written, then offers to run (and to save a config). See
+[Guided setup](#guided-setup-interactive).
+
 > **If `install.sh` can't set up pip** (`No module named pip`, `ensurepip is not
 > available`, or `No module named 'distutils'`) — common on a stripped Python 3.7 —
 > that's fine: **pymodbus is optional and the tool runs without it** on the built-in
@@ -173,6 +178,29 @@ printing its current value — a quick "am I ready to run a test?" check. If you
 setpoint register is genuinely write-only, the pre-write read would always fail; use
 `--skip-read-test` on the real run to bypass it.
 
+## Guided setup (interactive)
+
+Run with **no arguments** (or `--setup`) on a terminal to be walked through it:
+
+```bash
+./run.sh            # or:  ./run.sh --setup
+```
+
+It asks one value at a time:
+
+1. **Inverter connection** — IP, port, unit id, register, data type, word order (if
+   32-bit), setpoint mode, and the scale. It then **reads the register** to confirm
+   comms. If the read fails you can **retry**, jump to a **meter** check, or **quit** —
+   nothing is written until a read succeeds.
+2. **Meter comms** — lists the SMA meters it hears and lets you lock onto one by IP or
+   serial (or leave it unfiltered).
+3. **Test parameters** — the setpoint to command and **how many times** to write it
+   (trials).
+
+At the end it offers to save your answers to a config file (so next time is just
+`./run.sh --config <file>`), then runs the test. `--setup` pre-fills its defaults from
+any `--config` you also pass, so it doubles as a way to tweak an existing setup.
+
 ## Run a reaction test
 
 ```
@@ -249,6 +277,7 @@ register in `0.01 %` (write `5000` for 50 %) → `--pct-scale 0.01`. See
 | `--trials` / `--settle` / `--warmup` | Repeat measurements, settle time between, baseline window |
 | `--confirm` | Consecutive crossing samples required (>1 rejects noise spikes) |
 | `--no-reset` / `--reset-value` | By default the setpoint is written back to `0` (W or %) after each trial |
+| `--setup` | Interactive guided setup: prompt for each value, check comms, then run (also auto-starts on a bare `./run.sh`) |
 | `--probe` | Read-only comms check: read the inverter register and confirm meter reception, then exit (writes nothing) |
 | `--skip-read-test` | Skip the automatic pre-write read check (only if the setpoint register is write-only) |
 

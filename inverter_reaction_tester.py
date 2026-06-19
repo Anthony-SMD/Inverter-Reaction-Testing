@@ -51,6 +51,10 @@ Everything else is from the Python standard library.
 ------------------------------------------------------------------------------
 Examples
 ------------------------------------------------------------------------------
+  # 0) First time / no config: interactive guided setup (prompts for everything,
+  #    checks comms, then runs). Also auto-starts when run with no arguments.
+  python inverter_reaction_tester.py --setup
+
   # 1) Sanity check: just watch the meter net power
   python inverter_reaction_tester.py --monitor --meter-iface 192.168.1.50
 
@@ -988,6 +992,9 @@ def build_config():
     g.add_argument("--probe", action="store_true", default=d("probe", False),
                    help="read-only comms check: confirm meter reception and read the "
                         "inverter register, then exit (writes nothing)")
+    g.add_argument("--setup", action="store_true", default=False,
+                   help="interactive setup: prompt for each setting, check inverter "
+                        "and meter comms, then run (also auto-starts on a bare run)")
 
     args = p.parse_args()
 
@@ -1010,7 +1017,7 @@ def build_config():
         "measure_settled": args.measure_settled,
         "infer_timeout": args.infer_timeout, "settle_samples": args.settle_samples,
         "settle_band_frac": args.settle_band_frac,
-        "monitor": args.monitor,
+        "monitor": args.monitor, "setup": args.setup,
     }
     return cfg
 
@@ -1106,10 +1113,247 @@ def print_summary(results):
 
 
 # --------------------------------------------------------------------------- #
+# Interactive setup (wizard)
+# --------------------------------------------------------------------------- #
+def _ask(prompt, default=None, cast=str, choices=None, allow_blank=False):
+    """Prompt for one value; re-ask until valid. Enter accepts `default`.
+
+    Raises EOFError when stdin closes (Ctrl+D) and there is no default/blank
+    option, so the caller can cancel cleanly instead of looping forever.
+    """
+    while True:
+        suffix = f" [{default}]" if default is not None else ""
+        try:
+            raw = input(f"  {prompt}{suffix}: ").strip()
+        except EOFError:
+            if default is not None:
+                return default
+            if allow_blank:
+                return None
+            print()
+            raise
+        if raw == "":
+            if default is not None:
+                return default
+            if allow_blank:
+                return None
+            print("    (a value is required)")
+            continue
+        try:
+            value = cast(raw)
+        except (ValueError, TypeError):
+            print(f"    (invalid value: '{raw}')")
+            continue
+        if choices and value not in choices:
+            print(f"    (choose one of: {', '.join(map(str, choices))})")
+            continue
+        return value
+
+
+def _ask_yes_no(prompt, default=True):
+    hint = "Y/n" if default else "y/N"
+    while True:
+        try:
+            raw = input(f"  {prompt} [{hint}]: ").strip().lower()
+        except EOFError:
+            return default
+        if raw == "":
+            return default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print("    (please answer y or n)")
+
+
+def _meter_discover(cfg):
+    """Listen briefly and return {src_ip: serial} for every meter seen."""
+    rx = MeterReceiver(cfg["meter_group"], cfg["meter_port"], iface_ip=cfg["meter_iface"])
+    rx.start()
+    print("  ... listening for SMA meter datagrams ...")
+    first = wait_first_sample(rx, cfg["meter_timeout"])
+    try:
+        if rx.error:
+            print(f"  meter socket error: {rx.error}")
+            return {}
+        if first is None:
+            print(f"  no meter datagrams in {cfg['meter_timeout']:.0f}s "
+                  "(check VLAN / firewall / --meter-iface).")
+            return {}
+        time.sleep(1.5)                    # let any other meters announce themselves
+        return rx.sources()
+    finally:
+        rx.stop()
+
+
+def _setup_meter(cfg, allow_filter):
+    """Check meter comms; if allow_filter, let the user lock onto one meter."""
+    while True:
+        srcs = _meter_discover(cfg)
+        if not srcs:
+            if _ask_yes_no("No meter seen. Retry meter comms?", default=True):
+                continue
+            return
+        print(f"  {len(srcs)} meter(s) seen:")
+        for ip, serial in sorted(srcs.items()):
+            print(f"    {ip}   serial {serial}")
+        if not allow_filter:
+            return
+        if len(srcs) == 1 and not _ask_yes_no("Lock onto this one meter?", default=False):
+            cfg["meter_src_ip"], cfg["meter_serial"] = None, None
+            return
+        sel = _ask("Target meter - enter IP or serial (blank = no filter)",
+                   None, allow_blank=True)
+        if sel is None:
+            cfg["meter_src_ip"], cfg["meter_serial"] = None, None
+        elif sel in srcs or "." in sel:
+            cfg["meter_src_ip"], cfg["meter_serial"] = sel, None
+            print(f"    locked to IP {sel}")
+        elif sel.isdigit():
+            cfg["meter_serial"], cfg["meter_src_ip"] = int(sel), None
+            print(f"    locked to serial {sel}")
+        else:
+            print("    not recognised; no filter set")
+            cfg["meter_src_ip"], cfg["meter_serial"] = None, None
+        return
+
+
+# file-key -> cfg-key for the names that differ; the rest map 1:1
+_SAVE_KEYS = [
+    ("inv_host", "inv_host"), ("inv_port", "inv_port"), ("inv_unit", "unit"),
+    ("inv_register", "register"), ("datatype", "datatype"), ("word_order", "word_order"),
+    ("scale", "scale"), ("pct_scale", "pct_scale"), ("modbus_timeout", "modbus_timeout"),
+    ("mode", "mode"), ("target_w", "target_w"), ("target_percent", "target_percent"),
+    ("rated_w", "rated_w"), ("detect_watts", "detect_watts"), ("fraction", "fraction"),
+    ("timeout", "timeout"), ("confirm", "confirm"), ("meter_group", "meter_group"),
+    ("meter_port", "meter_port"), ("meter_iface", "meter_iface"),
+    ("meter_serial", "meter_serial"), ("meter_src_ip", "meter_src_ip"),
+    ("meter_timeout", "meter_timeout"), ("warmup", "warmup"), ("trials", "trials"),
+    ("settle", "settle"), ("reset_value", "reset_value"),
+    ("measure_settled", "measure_settled"), ("infer_timeout", "infer_timeout"),
+    ("settle_samples", "settle_samples"), ("settle_band_frac", "settle_band_frac"),
+]
+
+
+def _save_config(cfg, path):
+    out = {file_key: cfg[cfg_key] for file_key, cfg_key in _SAVE_KEYS}
+    out["no_reset"] = not cfg["reset"]
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(out, fh, indent=2)
+    print(f"  saved to {path} -- next time:  ./run.sh --config {path}")
+
+
+def run_setup(cfg):
+    """Interactively gather the minimum settings, checking comms as we go.
+
+    Returns the completed cfg, or None if the user cancels / declines to run.
+    """
+    try:
+        return _run_setup(cfg)
+    except EOFError:
+        print("\nSetup cancelled (no more input).")
+        return None
+
+
+def _run_setup(cfg):
+    print("=" * 66)
+    print(" Interactive setup  (Enter accepts [default], Ctrl+C cancels)")
+    print("=" * 66)
+
+    # Step 1: inverter connection -- repeat until a read succeeds.
+    print("\nStep 1 - inverter connection")
+    while True:
+        cfg["inv_host"] = _ask("Inverter IP / hostname", cfg["inv_host"])
+        cfg["inv_port"] = _ask("Modbus TCP port", cfg["inv_port"], int)
+        cfg["unit"] = _ask("Unit / slave id", cfg["unit"], int)
+        cfg["register"] = _ask("Power setpoint register address", cfg["register"], int)
+        cfg["datatype"] = _ask("Register data type", cfg["datatype"],
+                               cast=lambda s: s.upper(), choices=list(DATA_TYPES))
+        if DATA_TYPES[cfg["datatype"]][1] == 2:
+            cfg["word_order"] = _ask("Word order (32-bit)", cfg["word_order"],
+                                     cast=lambda s: s.lower(), choices=["big", "little"])
+        cfg["mode"] = _ask("Setpoint mode", cfg["mode"],
+                           cast=lambda s: s.lower(), choices=["watt", "percent"])
+        if cfg["mode"] == "percent":
+            cfg["pct_scale"] = _ask("Percent per register count (e.g. 0.1 if 100%% = 1000)",
+                                    cfg["pct_scale"], float)
+        else:
+            cfg["scale"] = _ask("Watts per register count (e.g. 1.0)", cfg["scale"], float)
+
+        print(f"  ... reading register {cfg['register']} to check inverter comms ...")
+        client, backend = make_modbus_client(cfg["inv_host"], cfg["inv_port"],
+                                             cfg["modbus_timeout"])
+        if not client.connect():
+            ok = False
+            err = f"could not connect to {cfg['inv_host']}:{cfg['inv_port']}"
+        else:
+            probe = probe_inverter(client, cfg)
+            client.close()
+            ok, err = probe["ok"], probe.get("error")
+            if ok:
+                print(f"  OK ({backend}): register {cfg['register']} currently = "
+                      f"{fmt_setpoint(probe['value'], cfg['mode'])} {setpoint_units(cfg)} "
+                      f"(raw {probe['raw']}).")
+        if ok:
+            break
+        print(f"  INVERTER COMMS FAILED: {err}")
+        choice = _ask("[r]etry inverter, check [m]eter comms, or [q]uit?", "r",
+                      cast=lambda s: s.lower(), choices=["r", "m", "q"])
+        if choice == "q":
+            return None
+        if choice == "m":
+            _setup_meter(cfg, allow_filter=False)
+        print()
+
+    # Step 2: meter comms (+ optional filter to one meter)
+    print("\nStep 2 - meter comms")
+    _setup_meter(cfg, allow_filter=True)
+
+    # Step 3: setpoint + number of writes
+    print("\nStep 3 - test parameters")
+    if cfg["mode"] == "percent":
+        cfg["target_percent"] = _ask("Setpoint to command (% of rated, e.g. 10 or -10)",
+                                     cfg["target_percent"], float)
+    else:
+        cfg["target_w"] = _ask("Setpoint to command (watts, e.g. -3000)",
+                               cfg["target_w"], float)
+    cfg["trials"] = _ask("How many times to write/change the setpoint (trials)",
+                         cfg["trials"], int)
+
+    print("\n" + "=" * 66)
+    print(" Setup complete")
+    print("=" * 66)
+    if _ask_yes_no("Save these settings to a config file for next time?", default=False):
+        try:
+            _save_config(cfg, _ask("Config file path", "my_setup.json"))
+        except OSError as exc:
+            print(f"  could not save: {exc}")
+    if not _ask_yes_no("Run the test now?", default=True):
+        return None
+    return cfg
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main():
+    no_args = len(sys.argv) == 1
     cfg = build_config()
+
+    # Interactive setup: explicit --setup, or a bare run on a terminal.
+    if cfg["setup"] or (no_args and sys.stdin.isatty()):
+        if not sys.stdin.isatty():
+            print("Interactive setup needs a terminal; pass --config or flags instead.",
+                  file=sys.stderr)
+            return 2
+        if no_args and not cfg["setup"]:
+            print("No arguments given - starting interactive setup.")
+            print("(Ctrl+C to cancel; re-run with --help to see all options.)\n")
+        cfg = run_setup(cfg)
+        if cfg is None:
+            print("Setup cancelled - nothing was written to the inverter.")
+            return 0
+
     errors = validate_config(cfg)
     if errors:
         print("Configuration error(s):", file=sys.stderr)
