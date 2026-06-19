@@ -1,0 +1,30 @@
+{
+  "_comment": "Copy to your own file and edit. Any value here can be overridden on the CLI. Keys use underscores (e.g. inv_host), matching the --inv-host options.",
+
+  "inv_host": "192.168.1.20",
+  "inv_port": 502,
+  "inv_unit": 3,
+  "inv_register": 40149,
+  "datatype": "S32",
+  "word_order": "big",
+  "scale": 1.0,
+  "modbus_timeout": 3.0,
+
+  "target_w": -3000,
+  "fraction": 0.5,
+  "timeout": 10.0,
+  "confirm": 1,
+
+  "meter_group": "239.12.255.254",
+  "meter_port": 9522,
+  "meter_iface": "192.168.1.50",
+  "meter_serial": null,
+  "meter_src_ip": null,
+  "meter_timeout": 5.0,
+
+  "warmup": 2.0,
+  "trials": 5,
+  "settle": 3.0,
+  "no_reset": false,
+  "reset_value": 0.0
+}
