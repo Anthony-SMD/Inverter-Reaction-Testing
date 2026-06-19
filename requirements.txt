@@ -1,4 +1,9 @@
-# pymodbus 3.x requires Python 3.8+. Python 3.7 (e.g. Debian buster / older
-# Raspberry Pi OS) gets the last 2.x release, which this tool also supports.
+# OPTIONAL. The tool has a built-in Modbus TCP client and runs on the standard
+# library alone, so you do NOT need to install anything to use it. pymodbus is
+# used automatically if it is present (slightly more battle-tested); install.sh
+# installs it when the system allows.
+#
+# pymodbus 3.x needs Python 3.8+. Python 3.7 (Debian buster / older Pi OS) gets
+# the last 2.x release.
 pymodbus>=3.0,<4 ; python_version >= "3.8"
 pymodbus==2.5.3  ; python_version <  "3.8"

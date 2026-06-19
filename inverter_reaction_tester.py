@@ -42,10 +42,9 @@ attempt a reaction test.
 ------------------------------------------------------------------------------
 Requirements
 ------------------------------------------------------------------------------
-  Python 3.7+. pymodbus 3.x on Python 3.8+, or pymodbus 2.5.3 on Python 3.7.
-  install.sh / requirements.txt select the right one automatically; manually:
-      pip install "pymodbus>=3.0,<4"     # Python 3.8+
-      pip install "pymodbus==2.5.3"      # Python 3.7
+  Python 3.7+. NO third-party packages required -- a built-in Modbus TCP client is
+  used when pymodbus is not installed. pymodbus is used automatically if present
+  (install.sh installs it when it can): pymodbus 3.x on Python 3.8+, 2.5.3 on 3.7.
 
 Everything else is from the Python standard library.
 
@@ -115,6 +114,124 @@ except ImportError:
     except ImportError:
         ModbusTcpClient = None
         _UNIT_KW = "slave"
+
+
+# --------------------------------------------------------------------------- #
+# Built-in Modbus TCP client (standard library only). Used when pymodbus is not
+# installed, so the tool needs NO third-party package -- handy on stripped-down
+# devices where pip/venv/distutils are missing. Implements only the three
+# function codes this tool uses: read holding registers (3), write single
+# register (6), write multiple registers (16).
+# --------------------------------------------------------------------------- #
+class _ModbusResponse:
+    """Minimal stand-in for a pymodbus response (.registers and .isError())."""
+
+    def __init__(self, registers=None, error=None):
+        self.registers = registers if registers is not None else []
+        self._error = error
+
+    def isError(self):
+        return self._error is not None
+
+    def __repr__(self):
+        if self._error is not None:
+            return f"ModbusError({self._error})"
+        return f"ModbusResponse(registers={self.registers})"
+
+
+class SimpleModbusTcpClient:
+    """Tiny synchronous Modbus TCP client built on the standard library.
+
+    Exposes the subset of the pymodbus API this tool uses, so it is a drop-in
+    fallback. Accepts the unit id as slave= or unit=. Not a general client.
+    """
+
+    def __init__(self, host, port=502, timeout=3.0):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self._sock = None
+        self._tid = 0
+
+    def connect(self):
+        try:
+            self._sock = socket.create_connection((self.host, self.port), self.timeout)
+            self._sock.settimeout(self.timeout)
+            return True
+        except OSError:
+            self._sock = None
+            return False
+
+    def close(self):
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+
+    @staticmethod
+    def _unit(kw):
+        return kw.get("slave", kw.get("unit", 1))
+
+    def _recv_exactly(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self._sock.recv(n - len(buf))
+            if not chunk:
+                raise OSError("connection closed by peer")
+            buf += chunk
+        return buf
+
+    def _transaction(self, unit, pdu):
+        """Send one request PDU; return the response PDU (or raise OSError)."""
+        self._tid = (self._tid + 1) & 0xFFFF
+        mbap = struct.pack(">HHHB", self._tid, 0, len(pdu) + 1, unit)
+        self._sock.sendall(mbap + pdu)
+        header = self._recv_exactly(7)                  # tid, proto, length, unit
+        _, _, length, _ = struct.unpack(">HHHB", header)
+        return self._recv_exactly(length - 1)           # response PDU
+
+    def read_holding_registers(self, address, count=1, **kw):
+        pdu = struct.pack(">BHH", 0x03, address, count)
+        try:
+            resp = self._transaction(self._unit(kw), pdu)
+        except OSError as exc:
+            return _ModbusResponse(error=str(exc))
+        if resp[0] & 0x80:
+            return _ModbusResponse(error=f"Modbus exception {resp[1]}")
+        byte_count = resp[1]
+        regs = list(struct.unpack(">" + "H" * (byte_count // 2), resp[2:2 + byte_count]))
+        return _ModbusResponse(registers=regs)
+
+    def write_register(self, address, value, **kw):
+        pdu = struct.pack(">BHH", 0x06, address, value & 0xFFFF)
+        try:
+            resp = self._transaction(self._unit(kw), pdu)
+        except OSError as exc:
+            return _ModbusResponse(error=str(exc))
+        if resp[0] & 0x80:
+            return _ModbusResponse(error=f"Modbus exception {resp[1]}")
+        return _ModbusResponse(registers=[value & 0xFFFF])
+
+    def write_registers(self, address, values, **kw):
+        count = len(values)
+        pdu = struct.pack(">BHHB", 0x10, address, count, count * 2)
+        pdu += b"".join(struct.pack(">H", v & 0xFFFF) for v in values)
+        try:
+            resp = self._transaction(self._unit(kw), pdu)
+        except OSError as exc:
+            return _ModbusResponse(error=str(exc))
+        if resp[0] & 0x80:
+            return _ModbusResponse(error=f"Modbus exception {resp[1]}")
+        return _ModbusResponse(registers=list(values))
+
+
+def make_modbus_client(host, port, timeout):
+    """Return (client, backend_name): pymodbus if installed, else the built-in."""
+    if ModbusTcpClient is not None:
+        return ModbusTcpClient(host, port=port, timeout=timeout), "pymodbus"
+    return SimpleModbusTcpClient(host, port=port, timeout=timeout), "built-in (stdlib)"
 
 
 # --------------------------------------------------------------------------- #
@@ -795,8 +912,6 @@ def build_config():
 def validate_config(cfg):
     errors = []
     if not cfg["monitor"]:
-        if ModbusTcpClient is None:
-            errors.append("pymodbus is not installed. Run: pip install pymodbus")
         if not cfg["inv_host"]:
             errors.append("--inv-host is required (or set inv_host in --config)")
         if cfg["register"] is None:
@@ -907,9 +1022,10 @@ def main():
             return 1
         print("Meter datagrams are being received.")
 
-        # Connect to the inverter.
-        client = ModbusTcpClient(cfg["inv_host"], port=cfg["inv_port"],
-                                 timeout=cfg["modbus_timeout"])
+        # Connect to the inverter (pymodbus if installed, else the built-in client).
+        client, backend = make_modbus_client(cfg["inv_host"], cfg["inv_port"],
+                                              cfg["modbus_timeout"])
+        print(f"Modbus backend: {backend}")
         if not client.connect():
             print(f"ERROR: could not connect to inverter at "
                   f"{cfg['inv_host']}:{cfg['inv_port']}")

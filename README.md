@@ -23,18 +23,19 @@ bash install.sh                     # builds ./.venv and installs pymodbus (once
 `install.sh` creates a self-contained `./.venv` (so it works on modern Debian/Ubuntu/
 Fedora, which block system-wide `pip install`). `run.sh` runs the tool through that venv.
 
-> **Fresh Debian / Ubuntu / Raspberry Pi OS:** if `install.sh` reports it can't set
-> up pip (`No module named pip`, `ensurepip is not available`, or `No module named
-> 'distutils'`), the system Python is missing pip's bootstrap and/or distutils. These
-> can't be fixed from inside the venv — install them once and re-run:
+> **If `install.sh` can't set up pip** (`No module named pip`, `ensurepip is not
+> available`, or `No module named 'distutils'`) — common on a stripped Python 3.7 —
+> that's fine: **pymodbus is optional and the tool runs without it** on the built-in
+> Modbus client. `install.sh` will say so, and `./run.sh` works regardless (it falls
+> back to the system `python3`).
+>
+> To install pymodbus anyway (optional), add the system packages once and re-run:
 >
 > ```bash
 > sudo apt update
 > sudo apt install -y python3-venv python3-pip python3-distutils
 > rm -rf .venv && bash install.sh
 > ```
->
-> (`python3-distutils` is only needed on Python < 3.12.)
 
 **Always do step 1 first.** `--monitor` should print live `net / import / export` watt
 readings. If it shows nothing, the meter multicast isn't reaching the tool — see
@@ -83,9 +84,11 @@ set first — this tool only writes register 1111. Also check the read-back line
 
 ## Install
 
-Needs Python **3.7+**. On Python 3.8+ it uses `pymodbus` 3.x; on Python 3.7 (e.g.
-Debian buster / older Raspberry Pi OS) it uses `pymodbus` 2.5.3. `install.sh` and
-`requirements.txt` pick the right one automatically.
+Needs Python **3.7+** and nothing else — the tool ships a **built-in Modbus TCP
+client**, so it runs on the standard library alone. `pymodbus` is optional and used
+automatically if it's installed; `install.sh` installs it when the system allows
+(pymodbus 3.x on Python 3.8+, 2.5.3 on Python 3.7). If pip can't be set up on the
+device, the tool still runs on the built-in client.
 
 **Linux / macOS** (creates a self-contained `./.venv`, recommended):
 

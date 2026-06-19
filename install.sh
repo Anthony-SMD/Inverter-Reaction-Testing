@@ -72,12 +72,23 @@ elif "$VENV_PY" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] < (3,
   NEED_SYS_PKGS="yes"
 fi
 if [ -n "$NEED_SYS_PKGS" ]; then
-  echo "ERROR: this Python ($PYVER) is missing pieces pip needs (pip bootstrap and/or distutils)." >&2
-  echo "On Debian/Ubuntu/Raspberry Pi OS, install them and re-run:" >&2
-  echo "  sudo apt update" >&2
-  echo "  sudo apt install -y python3-venv python3-pip python3-distutils" >&2
-  echo "  rm -rf .venv && bash install.sh" >&2
-  exit 1
+  chmod +x inverter_reaction_tester.py run.sh 2>/dev/null || true
+  cat <<EOF
+
+NOTE: pip could not be set up on this Python ($PYVER) -- it is missing the pip
+bootstrap (ensurepip / python3-venv) and/or distutils. That is OK: pymodbus is
+OPTIONAL. The tool ships a built-in Modbus TCP client and runs on the standard
+library alone, so you can use it right now:
+
+  ./run.sh --monitor                       # confirm the meter is received
+  ./run.sh --config default_config.json    # run the test
+
+To install pymodbus instead (optional), add the system packages and re-run:
+  sudo apt update
+  sudo apt install -y python3-venv python3-pip python3-distutils
+  rm -rf .venv && bash install.sh
+EOF
+  exit 0
 fi
 
 # --- install dependencies into the venv ------------------------------------
