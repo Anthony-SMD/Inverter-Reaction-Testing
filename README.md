@@ -23,15 +23,18 @@ bash install.sh                     # builds ./.venv and installs pymodbus (once
 `install.sh` creates a self-contained `./.venv` (so it works on modern Debian/Ubuntu/
 Fedora, which block system-wide `pip install`). `run.sh` runs the tool through that venv.
 
-> **Fresh Debian / Ubuntu / Raspberry Pi OS:** if `install.sh` reports `No module
-> named pip` or `ensurepip is not available`, the system is missing pip's bootstrap.
-> `install.sh` tries to fetch it automatically, but the clean fix is one apt command,
-> then re-run:
+> **Fresh Debian / Ubuntu / Raspberry Pi OS:** if `install.sh` reports it can't set
+> up pip (`No module named pip`, `ensurepip is not available`, or `No module named
+> 'distutils'`), the system Python is missing pip's bootstrap and/or distutils. These
+> can't be fixed from inside the venv — install them once and re-run:
 >
 > ```bash
-> sudo apt update && sudo apt install -y python3-venv python3-pip
+> sudo apt update
+> sudo apt install -y python3-venv python3-pip python3-distutils
 > rm -rf .venv && bash install.sh
 > ```
+>
+> (`python3-distutils` is only needed on Python < 3.12.)
 
 **Always do step 1 first.** `--monitor` should print live `net / import / export` watt
 readings. If it shows nothing, the meter multicast isn't reaching the tool — see

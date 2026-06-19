@@ -46,24 +46,38 @@ case "$PYVER" in
   *)           GETPIP_URL="https://bootstrap.pypa.io/get-pip.py" ;;
 esac
 
-# --- make sure pip exists inside the venv ----------------------------------
+# --- bootstrap pip into the venv if missing (tolerant; verified below) ------
 if ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
   echo "pip is not in the venv yet; bootstrapping it (Python $PYVER) ..."
-  if "$VENV_PY" -m ensurepip --upgrade >/dev/null 2>&1; then
-    :                                            # ensurepip worked (offline)
-  elif command -v curl >/dev/null 2>&1; then
-    echo "  fetching $GETPIP_URL ..."
-    curl -fsSL "$GETPIP_URL" | "$VENV_PY" -
-  elif command -v wget >/dev/null 2>&1; then
-    echo "  fetching $GETPIP_URL ..."
-    wget -qO- "$GETPIP_URL" | "$VENV_PY" -
-  else
-    echo "ERROR: could not bootstrap pip (no ensurepip, and no curl/wget to fetch it)." >&2
-    echo "Install the system packages, then re-run:" >&2
-    echo "  sudo apt install python3-venv python3-pip   # Debian/Ubuntu/Raspberry Pi OS" >&2
-    echo "  rm -rf .venv && bash install.sh" >&2
-    exit 1
+  if ! "$VENV_PY" -m ensurepip --upgrade >/dev/null 2>&1; then
+    if command -v curl >/dev/null 2>&1; then
+      echo "  trying $GETPIP_URL ..."
+      curl -fsSL "$GETPIP_URL" 2>/dev/null | "$VENV_PY" - >/dev/null 2>&1 || true
+    elif command -v wget >/dev/null 2>&1; then
+      echo "  trying $GETPIP_URL ..."
+      wget -qO- "$GETPIP_URL" 2>/dev/null | "$VENV_PY" - >/dev/null 2>&1 || true
+    fi
   fi
+fi
+
+# --- verify the venv is usable ---------------------------------------------
+# Stripped Debian/Ubuntu/Raspberry Pi OS Pythons can be missing ensurepip
+# (python3-venv) and/or distutils (python3-distutils, which pip needs on < 3.12).
+# Neither is fixable from inside the venv, so point at the one apt command.
+NEED_SYS_PKGS=""
+if ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
+  NEED_SYS_PKGS="yes"
+elif "$VENV_PY" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] < (3, 12) else 1)' \
+     && ! "$VENV_PY" -c 'import distutils.cmd' >/dev/null 2>&1; then
+  NEED_SYS_PKGS="yes"
+fi
+if [ -n "$NEED_SYS_PKGS" ]; then
+  echo "ERROR: this Python ($PYVER) is missing pieces pip needs (pip bootstrap and/or distutils)." >&2
+  echo "On Debian/Ubuntu/Raspberry Pi OS, install them and re-run:" >&2
+  echo "  sudo apt update" >&2
+  echo "  sudo apt install -y python3-venv python3-pip python3-distutils" >&2
+  echo "  rm -rf .venv && bash install.sh" >&2
+  exit 1
 fi
 
 # --- install dependencies into the venv ------------------------------------
