@@ -7,6 +7,52 @@ The tool times the gap between *writing the setpoint to the inverter* and *the m
 seeing the power change* — without reading anything from the inverter during the
 measurement window.
 
+## Quick start — run on the Linux device
+
+Clone the repo on the device, install once, then run:
+
+```bash
+git clone https://github.com/Anthony-SMD/Inverter-Reaction-Testing.git
+cd Inverter-Reaction-Testing
+bash install.sh                     # builds ./.venv and installs pymodbus (once)
+
+./run.sh --monitor                  # 1) confirm the SMA meter is being received
+./run.sh --config default_config.json   # 2) run the reaction test
+```
+
+`install.sh` creates a self-contained `./.venv` (so it works on modern Debian/Ubuntu/
+Fedora, which block system-wide `pip install`). `run.sh` runs the tool through that venv.
+
+**Always do step 1 first.** `--monitor` should print live `net / import / export` watt
+readings. If it shows nothing, the meter multicast isn't reaching the tool — see
+[Troubleshooting](#troubleshooting) below (usually a firewall or wrong NIC).
+
+### What `default_config.json` does
+
+| | |
+|---|---|
+| Inverter | `192.168.101.28:503`, unit **1**, register **1111** |
+| Register | **S16** (signed, 1 register), `pct_scale 0.1` → 100% = raw 1000 |
+| Setpoint | **percent mode**, **10%** → raw 100 (reset to 0 after each trial) |
+| Rated power | inferred from the meter reaction |
+| Meter | SMA Speedwire on the **default network interface** |
+| Trials | 5 |
+
+Override anything per run without editing the file, e.g. the other direction or a
+bigger swing:
+
+```bash
+./run.sh --config default_config.json --target-percent -10
+./run.sh --config default_config.json --target-percent 25 --trials 3
+```
+
+### If it writes OK but the meter never moves
+
+Many inverters ignore a power setpoint until an **external-control-enable** register is
+set first — this tool only writes register 1111. Also check the read-back line: it shows
+`MISMATCH` if the S16 type / `pct_scale` is wrong for register 1111. See
+[Important caveats](#important-caveats).
+
 ## How it works (per trial)
 
 1. A background thread continuously receives the SMA energy-meter multicast
